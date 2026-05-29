@@ -11,7 +11,7 @@ readonly RESET='\033[0m'
 readonly BOLD='\033[1m'
 readonly SCRIPT_NAME="minions"
 readonly VERSION="1.0.0"
-readonly DEFAULT_REPO="PaulRBerg/agent-skills"
+readonly DEFAULT_REPO="treramey/skills"
 
 SCRIPT_PATH="${BASH_SOURCE[0]}"
 while [[ -L "$SCRIPT_PATH" ]]; do
@@ -180,9 +180,10 @@ cmd_kill() {
     require_cmd npx
     ensure_shelf_file
 
+    (cd "$ROOT_DIR" && npx skills remove "$@" --global --agent claude-code --yes > /dev/null)
+
     local name
     for name in "$@"; do
-        (cd "$ROOT_DIR" && npx skills remove "$name" --global --agent claude-code --yes > /dev/null)
         json_update --arg n "$name" '. + [$n] | unique | sort'
         print_warning "Shelved: ${BOLD}$name${RESET}"
     done
@@ -205,14 +206,11 @@ cmd_install_all() {
     local removed=()
     local name
     while IFS= read -r name; do
-        [[ -n "$name" ]] || continue
-        if [[ -d "$SKILLS_DIR/$name" ]]; then
-            (cd "$ROOT_DIR" && npx skills remove "$name" --global --agent claude-code --yes > /dev/null)
-            removed+=("$name")
-        fi
+        [[ -n "$name" && -d "$SKILLS_DIR/$name" ]] && removed+=("$name")
     done < <(jq -r '.[]' "$SHELF_FILE")
 
     if [[ ${#removed[@]} -gt 0 ]]; then
+        (cd "$ROOT_DIR" && npx skills remove "${removed[@]}" --global --agent claude-code --yes > /dev/null)
         print_warning "Removed shelved skills: ${BOLD}${removed[*]}${RESET}"
     fi
 }
@@ -230,19 +228,11 @@ cmd_reset_skills() {
         return 0
     fi
 
-    (cd "$ROOT_DIR" && npx skills remove --all --global --yes > /dev/null)
+    (cd "$ROOT_DIR" && npx skills remove --skill '*' --agent claude-code --yes --global > /dev/null)
     rm -f "$LOCK_FILE"
     printf '[]\n' > "$SHELF_FILE"
 
     print_success "Skills purged"
-    cat <<EOF
-
-Run these commands to reinstall:
-
-  npx skills add PaulRBerg/agent-skills
-  npx skills add sablier-labs/agent-skills
-  npx skills add vercel-labs/agent-skills
-EOF
 }
 
 cmd_mdformat_check() {
