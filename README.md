@@ -11,27 +11,13 @@ This repo stores local copies of agent skills and tracks which ones are active o
 - `shelf.json` — skills intentionally removed from the active set
 - `minions` — CLI for listing, installing, shelving, activating, and formatting skills
 
-## Requirements
-
-- `git`
-- `jq`
-- `npx`
-- `uvx` for Markdown formatting commands
-
-The script uses the `skills` CLI through `npx`:
-
-```bash
-npx skills add ...
-npx skills remove ...
-```
 
 ## Quick start
 
 ```bash
-git clone git@github.com:treramey/dot_minions.git
-cd dot_minions
+git clone git@github.com:treramey/dot_minions.git .agents
+cd .agents
 
-./minions census
 ./minions install
 ```
 
