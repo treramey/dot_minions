@@ -10,8 +10,7 @@ readonly CYAN='\033[0;36m'
 readonly RESET='\033[0m'
 readonly BOLD='\033[1m'
 readonly SCRIPT_NAME="minion"
-readonly VERSION="1.0.0"
-readonly DEFAULT_REPO="treramey/skills"
+readonly VERSION="2.0.0"
 
 SCRIPT_PATH="${BASH_SOURCE[0]}"
 while [[ -L "$SCRIPT_PATH" ]]; do
@@ -25,6 +24,14 @@ readonly SHELF_FILE="$ROOT_DIR/shelf.json"
 readonly LOCK_FILE="$ROOT_DIR/.skill-lock.json"
 readonly SKILLS_DIR="$ROOT_DIR/skills"
 
+# Harnesses the store fans out to. Symlinks are absolute and uniform across all
+# three, so depth (Claude/Codex are 2 levels deep, Pi is 3) does not matter.
+readonly HARNESS_DIRS=(
+    "$HOME/.claude/skills"
+    "$HOME/.codex/skills"
+    "$HOME/.pi/agent/skills"
+)
+
 
 print_header()  { echo -e "\n${BOLD}${BLUE}==>${RESET} ${BOLD}$1${RESET}"; }
 print_success() { echo -e "${GREEN}✓${RESET} $1"; }
@@ -33,6 +40,15 @@ print_warning() { echo -e "${YELLOW}⚠${RESET} $1"; }
 print_info()    { echo -e "${CYAN}ℹ${RESET} $1"; }
 
 command_exists() { command -v "$1" >/dev/null 2>&1; }
+
+pretty_path() {
+    local p="$1"
+    if [[ "$p" == "$HOME"/* ]]; then
+        echo "~/${p#"$HOME"/}"
+    else
+        echo "$p"
+    fi
+}
 
 confirm() {
     local prompt="${1:-Continue?}" default="${2:-n}"
@@ -86,14 +102,6 @@ json_update() {
     mv "$tmp" "$SHELF_FILE"
 }
 
-skill_name_from_path() {
-    local skill_path="$1"
-    local skill_dir
-
-    skill_dir=$(dirname "$skill_path")
-    basename "$skill_dir"
-}
-
 print_prefixed() {
     local prefix="$1" color="$2"
     while IFS= read -r line; do
@@ -101,25 +109,128 @@ print_prefixed() {
     done
 }
 
-list_active_skills() {
-    if [[ ! -d "$SKILLS_DIR" ]]; then
-        echo -e "  ${YELLOW}(none)${RESET}"
-        return
-    fi
+# --- store + symlink helpers -------------------------------------------------
 
-    local entries=()
+# Names of every skill in the store (a dir containing SKILL.md), one per line.
+store_skills() {
+    [[ -d "$SKILLS_DIR" ]] || return 0
     local path
     shopt -s nullglob
-    for path in "$SKILLS_DIR"/*; do
-        entries+=("$(basename "$path")")
+    for path in "$SKILLS_DIR"/*/; do
+        [[ -f "${path}SKILL.md" ]] && basename "$path"
     done
     shopt -u nullglob
+}
 
-    if [[ ${#entries[@]} -eq 0 ]]; then
-        echo -e "  ${YELLOW}(none)${RESET}"
-    else
-        printf '%s\n' "${entries[@]}" | sort | print_prefixed "▸" "$CYAN"
-    fi
+is_shelved() {
+    local name="$1"
+    ensure_shelf_file
+    jq -e --arg n "$name" 'index($n) != null' "$SHELF_FILE" >/dev/null 2>&1
+}
+
+# Paths of symlinks in a harness that point into the store, one per line. These
+# are the only entries minion owns; everything else (foreign skills, plain
+# files) is left untouched.
+store_links_in() {
+    local harness="$1" target dest
+    [[ -d "$harness" ]] || return 0
+    shopt -s nullglob
+    for target in "$harness"/*; do
+        [[ -L "$target" ]] || continue
+        dest="$(readlink "$target")"
+        [[ "$dest" == "$SKILLS_DIR/"* ]] && printf '%s\n' "$target"
+    done
+    shopt -u nullglob
+}
+
+# How many harnesses currently hold a live symlink for <name>.
+skill_coverage() {
+    local name="$1" harness target dest count=0
+    for harness in "${HARNESS_DIRS[@]}"; do
+        target="$harness/$name"
+        [[ -L "$target" && -e "$target" ]] || continue
+        dest="$(readlink "$target")"
+        [[ "$dest" == "$SKILLS_DIR/"* ]] && count=$((count + 1))
+    done
+    echo "$count"
+}
+
+harness_link_count() { store_links_in "$1" | wc -l | tr -d ' '; }
+
+# Point <harness>/<name> at $SKILLS_DIR/<name> in every harness. Replaces a
+# stale copy (real dir of the same name) or any existing symlink; never touches
+# a foreign skill (a name not present in the store) or a plain file.
+link_skill() {
+    local name="$1" src="$SKILLS_DIR/$name"
+    local harness target
+    for harness in "${HARNESS_DIRS[@]}"; do
+        mkdir -p "$harness"
+        target="$harness/$name"
+        if [[ ! -L "$target" && -e "$target" ]]; then
+            if [[ -d "$target" ]]; then
+                rm -rf "$target"   # stale copy we own by name -> replace with link
+            else
+                print_warning "Skipping non-dir file: $(pretty_path "$target")"
+                continue
+            fi
+        fi
+        ln -sfn "$src" "$target"
+    done
+}
+
+# Remove <harness>/<name> in every harness, but only if it is a symlink. Never
+# deletes a real dir we do not own.
+unlink_skill() {
+    local name="$1" harness target
+    for harness in "${HARNESS_DIRS[@]}"; do
+        target="$harness/$name"
+        [[ -L "$target" ]] && rm -f "$target"
+    done
+    return 0
+}
+
+# Remove store-pointing symlinks that are now dangling or shelved. Echoes the
+# number pruned. Leaves live, active links and all foreign entries in place.
+prune_dead_links() {
+    local harness link name pruned=0
+    for harness in "${HARNESS_DIRS[@]}"; do
+        while IFS= read -r link; do
+            [[ -n "$link" ]] || continue
+            name="$(basename "$link")"
+            if [[ ! -e "$link" ]] || is_shelved "$name"; then
+                rm -f "$link"
+                pruned=$((pruned + 1))
+            fi
+        done < <(store_links_in "$harness")
+    done
+    echo "$pruned"
+}
+
+# --- listings ----------------------------------------------------------------
+
+list_active_skills() {
+    local names name cov n_harness=${#HARNESS_DIRS[@]} color
+    names=$(store_skills | sort)
+
+    # Active = in the store and not shelved.
+    local printed=0
+    while IFS= read -r name; do
+        [[ -n "$name" ]] || continue
+        if is_shelved "$name"; then continue; fi
+        cov=$(skill_coverage "$name")
+        if [[ "$cov" -eq "$n_harness" ]]; then
+            color="$GREEN"
+        elif [[ "$cov" -eq 0 ]]; then
+            color="$YELLOW"
+        else
+            color="$CYAN"
+        fi
+        echo -e "  ${color}▸ ${name} (${cov}/${n_harness})${RESET}"
+        printed=$((printed + 1))
+    done <<< "$names"
+
+    [[ "$printed" -eq 0 ]] && echo -e "  ${YELLOW}(none)${RESET}"
+    return 0
 }
 
 list_shelved_skills() {
@@ -135,8 +246,11 @@ list_shelved_skills() {
     fi
 }
 
+# --- commands ----------------------------------------------------------------
+
 cmd_census() {
     require_cmd jq
+    ensure_shelf_file
 
     print_header "Active minions"
     list_active_skills
@@ -150,23 +264,16 @@ cmd_activate() {
         return 1
     }
     require_cmd jq
-    require_cmd npx
-    require_file "$LOCK_FILE"
     ensure_shelf_file
 
-    local name source skill_path upstream_name
+    local name
     for name in "$@"; do
-        source=$(jq -r --arg n "$name" '.skills[$n].source // empty' "$LOCK_FILE")
-        skill_path=$(jq -r --arg n "$name" '.skills[$n].skillPath // empty' "$LOCK_FILE")
-        if [[ -z "$source" || -z "$skill_path" ]]; then
-            print_error "No source found for $name in .skill-lock.json"
+        if [[ ! -f "$SKILLS_DIR/$name/SKILL.md" ]]; then
+            print_error "Not in store: $name"
             return 1
         fi
-
-        upstream_name=$(skill_name_from_path "$skill_path")
-
-        (cd "$ROOT_DIR" && npx skills add "$source" --global --agent claude-code --skill "$upstream_name" --yes > /dev/null)
         json_update --arg n "$name" '. - [$n]'
+        link_skill "$name"
         print_success "Activated: ${BOLD}$name${RESET}"
     done
 }
@@ -177,42 +284,98 @@ cmd_kill() {
         return 1
     }
     require_cmd jq
-    require_cmd npx
     ensure_shelf_file
-
-    (cd "$ROOT_DIR" && npx skills remove "$@" --global --agent claude-code --yes > /dev/null)
 
     local name
     for name in "$@"; do
+        unlink_skill "$name"
         json_update --arg n "$name" '. + [$n] | unique | sort'
         print_warning "Shelved: ${BOLD}$name${RESET}"
     done
 }
 
 cmd_install_all() {
-    [[ $# -le 1 ]] || {
-        print_error "Usage: ${SCRIPT_NAME} install [repo]"
+    [[ $# -eq 0 ]] || {
+        print_error "Usage: ${SCRIPT_NAME} install"
+        return 1
+    }
+    require_cmd jq
+    require_cmd npx
+    require_cmd git
+    ensure_shelf_file
+    require_clean
+
+    # 1. Refresh the global store from the global lock + sources. Do not use
+    #    experimental_install here: it restores project skills into
+    #    "$ROOT_DIR/.agents/skills", which is not minion's store.
+    print_header "Refreshing store"
+    if (cd "$ROOT_DIR" && npx skills update --global --yes); then
+        print_success "Updated store skills to latest"
+    else
+        print_warning "update reported errors (continuing)"
+    fi
+
+    # 2. Fan the store out: every active (non-shelved) store skill -> harnesses.
+    print_header "Linking active skills into harnesses"
+    local linked=0 skipped=0 name
+    while IFS= read -r name; do
+        [[ -n "$name" ]] || continue
+        if is_shelved "$name"; then
+            skipped=$((skipped + 1))
+            continue
+        fi
+        link_skill "$name"
+        linked=$((linked + 1))
+    done < <(store_skills)
+
+    # 3. Drop links that are now dangling or shelved.
+    local pruned
+    pruned=$(prune_dead_links)
+
+    # 4. Summary.
+    print_header "Sync summary"
+    local total
+    total=$(store_skills | wc -l | tr -d ' ')
+    print_info "Store: ${total} skills (${linked} active, ${skipped} shelved)"
+    local harness
+    for harness in "${HARNESS_DIRS[@]}"; do
+        print_info "$(pretty_path "$harness"): $(harness_link_count "$harness") linked"
+    done
+    [[ "$pruned" -gt 0 ]] && print_warning "Pruned ${pruned} dead/shelved link(s)"
+    print_success "Install complete"
+}
+
+cmd_add() {
+    [[ $# -gt 0 ]] || {
+        print_error "Usage: ${SCRIPT_NAME} add <repo> [skill...]"
         return 1
     }
     require_cmd jq
     require_cmd npx
     ensure_shelf_file
-    require_clean
 
-    local repo="${1:-$DEFAULT_REPO}"
-    (cd "$ROOT_DIR" && npx skills add "$repo" --global --agent claude-code --skill '*' --yes > /dev/null)
-    print_success "Installed all skills from $repo"
-
-    local removed=()
-    local name
-    while IFS= read -r name; do
-        [[ -n "$name" && -d "$SKILLS_DIR/$name" ]] && removed+=("$name")
-    done < <(jq -r '.[]' "$SHELF_FILE")
-
-    if [[ ${#removed[@]} -gt 0 ]]; then
-        (cd "$ROOT_DIR" && npx skills remove "${removed[@]}" --global --agent claude-code --yes > /dev/null)
-        print_warning "Removed shelved skills: ${BOLD}${removed[*]}${RESET}"
+    local repo="$1"; shift
+    local skills_arg='*'
+    if [[ $# -gt 0 ]]; then
+        skills_arg="$(IFS=,; echo "$*")"
     fi
+
+    print_header "Adding ${repo} to the store"
+    if ! (cd "$ROOT_DIR" && npx skills add "$repo" --global --skill "$skills_arg" --yes); then
+        print_warning "npx skills add reported errors (continuing to link what landed)"
+    fi
+
+    print_header "Linking active skills into harnesses"
+    local linked=0 name
+    while IFS= read -r name; do
+        [[ -n "$name" ]] || continue
+        if is_shelved "$name"; then continue; fi
+        link_skill "$name"
+        linked=$((linked + 1))
+    done < <(store_skills)
+    prune_dead_links >/dev/null
+
+    print_success "Added ${repo}; ${linked} active skill(s) linked"
 }
 
 cmd_reset_skills() {
@@ -220,19 +383,23 @@ cmd_reset_skills() {
         print_error "Usage: ${SCRIPT_NAME} reset"
         return 1
     }
-    require_cmd npx
-    require_clean
+    require_cmd jq
+    ensure_shelf_file
 
-    if ! confirm "This will purge all skills. Continue?" "n"; then
+    if ! confirm "Unlink every store skill from all harnesses and clear the shelf?" "n"; then
         print_info "Cancelled."
         return 0
     fi
 
-    (cd "$ROOT_DIR" && npx skills remove --skill '*' --agent claude-code --yes --global > /dev/null)
-    rm -f "$LOCK_FILE"
-    printf '[]\n' > "$SHELF_FILE"
+    local harness link
+    for harness in "${HARNESS_DIRS[@]}"; do
+        while IFS= read -r link; do
+            [[ -n "$link" ]] && rm -f "$link"
+        done < <(store_links_in "$harness")
+    done
 
-    print_success "Skills purged"
+    printf '[]\n' > "$SHELF_FILE"
+    print_success "Unlinked all store skills and reset the shelf. Store and lock left intact."
 }
 
 cmd_mdformat_check() {
@@ -252,17 +419,18 @@ cmd_mdformat_write() {
 }
 
 cmd_help() {
-    echo -e "${BOLD}${SCRIPT_NAME}${RESET} - Agent skills management tool (v${VERSION})"
+    echo -e "${BOLD}${SCRIPT_NAME}${RESET} - Skill store + multi-harness symlink manager (v${VERSION})"
     echo ""
     echo -e "${BOLD}USAGE:${RESET}"
     echo "    ${SCRIPT_NAME} [OPTIONS] COMMAND [ARGS]"
     echo ""
     echo -e "${BOLD}COMMANDS:${RESET}"
-    echo "    census                      Show active and shelved minions"
-    echo "    activate <name>...          Activate shelved minions"
-    echo "    kill <name>...              Deactivate/shelve minions"
-    echo "    install [repo]              Install repo minions, then remove shelved ones"
-    echo "    reset                       Purge all minions and reset shelf.json"
+    echo "    census                      Show active (with harness coverage) and shelved minions"
+    echo "    install                     Refresh the store, then symlink active skills into every harness"
+    echo "    add <repo> [skill...]       Add skills from a repo to the store, then symlink them"
+    echo "    activate <name>...          Unshelve store skills and symlink them into every harness"
+    echo "    kill <name>...              Shelve skills: drop their symlinks, keep the store copy"
+    echo "    reset                       Unlink every store skill from all harnesses and clear the shelf"
     echo "    check [path]                Check Markdown formatting"
     echo "    format [path]               Format Markdown files"
     echo "    help                        Show this help"
@@ -271,11 +439,17 @@ cmd_help() {
     echo "    --version                   Show version"
     echo "    -h, --help                  Show help"
     echo ""
+    echo -e "${BOLD}HARNESSES:${RESET}"
+    local harness
+    for harness in "${HARNESS_DIRS[@]}"; do
+        echo "    $(pretty_path "$harness")"
+    done
+    echo ""
     echo -e "${BOLD}CONFIGURATION:${RESET}"
     echo "    Root:   ${ROOT_DIR}"
     echo "    Shelf:  ${SHELF_FILE}"
     echo "    Lock:   ${LOCK_FILE}"
-    echo "    Skills: ${SKILLS_DIR}"
+    echo "    Store:  ${SKILLS_DIR}"
     echo ""
 }
 
@@ -296,10 +470,11 @@ main() {
         activate)   cmd_activate "$@" ;;
         kill)       cmd_kill "$@" ;;
         install)    cmd_install_all "$@" ;;
+        add)        cmd_add "$@" ;;
         reset)      cmd_reset_skills "$@" ;;
         check)      cmd_mdformat_check "$@" ;;
         format)     cmd_mdformat_write "$@" ;;
-        help)                            cmd_help ;;
+        help)       cmd_help ;;
         *)
             print_error "Unknown command: $cmd"
             echo "Run '${SCRIPT_NAME} help' for usage"

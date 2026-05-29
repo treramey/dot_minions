@@ -8,7 +8,7 @@
       "skillPath": "skills/commit/SKILL.md",
       "skillFolderHash": "9af3cd20eeb597796a60d71f9058769337bd3edf",
       "installedAt": "2026-05-29T15:08:23.077Z",
-      "updatedAt": "2026-05-29T15:08:23.077Z"
+      "updatedAt": "2026-05-29T15:10:45.687Z"
     },
     "create-jira-ticket": {
       "source": "treramey/skills",
@@ -17,7 +17,7 @@
       "skillPath": "skills/create-jira-ticket/SKILL.md",
       "skillFolderHash": "e1befeae65607e3d6a105507abd281299e0cafc2",
       "installedAt": "2026-05-29T15:08:23.079Z",
-      "updatedAt": "2026-05-29T15:08:23.079Z"
+      "updatedAt": "2026-05-29T15:10:45.689Z"
     },
     "effect-ts": {
       "source": "treramey/skills",
@@ -26,7 +26,7 @@
       "skillPath": "skills/effect-ts/SKILL.md",
       "skillFolderHash": "2aa01d2b0441a8807cbd5e12a89fe7e2fc219715",
       "installedAt": "2026-05-29T15:08:23.080Z",
-      "updatedAt": "2026-05-29T15:08:23.080Z"
+      "updatedAt": "2026-05-29T15:10:45.690Z"
     },
     "init-deep": {
       "source": "treramey/skills",
@@ -35,7 +35,7 @@
       "skillPath": "skills/init-deep/SKILL.md",
       "skillFolderHash": "09f83582d2ce6aa404f78586c35837b3782e5e0a",
       "installedAt": "2026-05-29T15:08:23.080Z",
-      "updatedAt": "2026-05-29T15:08:23.080Z"
+      "updatedAt": "2026-05-29T15:10:45.690Z"
     },
     "md-docs": {
       "source": "treramey/skills",
@@ -44,7 +44,7 @@
       "skillPath": "skills/md-docs/SKILL.md",
       "skillFolderHash": "f1ccdcf28526bf4725b3df000b832e2945d3c6ee",
       "installedAt": "2026-05-29T15:08:23.081Z",
-      "updatedAt": "2026-05-29T15:08:23.081Z"
+      "updatedAt": "2026-05-29T15:10:45.690Z"
     },
     "oracle-codex": {
       "source": "treramey/skills",
@@ -53,7 +53,7 @@
       "skillPath": "skills/oracle-codex/SKILL.md",
       "skillFolderHash": "285e8b90c45f3a2514adb2b333a0a0a0fd51c4b0",
       "installedAt": "2026-05-29T15:08:23.081Z",
-      "updatedAt": "2026-05-29T15:08:23.081Z"
+      "updatedAt": "2026-05-29T15:10:45.691Z"
     },
     "tmux": {
       "source": "treramey/skills",
@@ -62,7 +62,7 @@
       "skillPath": "skills/tmux/SKILL.md",
       "skillFolderHash": "07deffd0be9d7e288021b087684faa020c79c116",
       "installedAt": "2026-05-29T15:08:23.081Z",
-      "updatedAt": "2026-05-29T15:08:23.081Z"
+      "updatedAt": "2026-05-29T15:10:45.691Z"
     },
     "write-a-skill": {
       "source": "treramey/skills",
@@ -71,7 +71,7 @@
       "skillPath": "skills/write-a-skill/SKILL.md",
       "skillFolderHash": "dcc3f2e14b1a4d44d7b4b9becbbeff0f780fb132",
       "installedAt": "2026-05-29T15:08:23.081Z",
-      "updatedAt": "2026-05-29T15:08:23.081Z"
+      "updatedAt": "2026-05-29T15:10:45.692Z"
     }
   },
   "dismissed": {}
