@@ -1,0 +1,8 @@
+# Dependencies
+.venv/
+node_modules/
+skills/
+
+# Files
+.DS_Store
+.temp-execution-*.js

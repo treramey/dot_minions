@@ -1,0 +1,321 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+readonly RED='\033[0;31m'
+readonly GREEN='\033[0;32m'
+readonly YELLOW='\033[0;33m'
+readonly BLUE='\033[0;34m'
+readonly CYAN='\033[0;36m'
+readonly RESET='\033[0m'
+readonly BOLD='\033[1m'
+readonly SCRIPT_NAME="minions"
+readonly VERSION="1.0.0"
+readonly DEFAULT_REPO="PaulRBerg/agent-skills"
+
+SCRIPT_PATH="${BASH_SOURCE[0]}"
+while [[ -L "$SCRIPT_PATH" ]]; do
+    SCRIPT_DIR="$(cd -P "$(dirname "$SCRIPT_PATH")" >/dev/null 2>&1 && pwd)"
+    SCRIPT_PATH="$(readlink "$SCRIPT_PATH")"
+    [[ "$SCRIPT_PATH" != /* ]] && SCRIPT_PATH="$SCRIPT_DIR/$SCRIPT_PATH"
+done
+ROOT_DIR="$(cd -P "$(dirname "$SCRIPT_PATH")" >/dev/null 2>&1 && pwd)"
+readonly ROOT_DIR
+readonly SHELF_FILE="$ROOT_DIR/shelf.json"
+readonly LOCK_FILE="$ROOT_DIR/.skill-lock.json"
+readonly SKILLS_DIR="$ROOT_DIR/skills"
+
+
+print_header()  { echo -e "\n${BOLD}${BLUE}==>${RESET} ${BOLD}$1${RESET}"; }
+print_success() { echo -e "${GREEN}✓${RESET} $1"; }
+print_error()   { echo -e "${RED}✗${RESET} $1" >&2; }
+print_warning() { echo -e "${YELLOW}⚠${RESET} $1"; }
+print_info()    { echo -e "${CYAN}ℹ${RESET} $1"; }
+
+command_exists() { command -v "$1" >/dev/null 2>&1; }
+
+confirm() {
+    local prompt="${1:-Continue?}" default="${2:-n}"
+    if [[ "$default" == "y" ]]; then prompt="$prompt [Y/n]: "; else prompt="$prompt [y/N]: "; fi
+    read -r -p "$prompt" response
+    case "$response" in
+        [yY][eE][sS]|[yY]) return 0 ;;
+        [nN][oO]|[nN]) return 1 ;;
+        "") [[ "$default" == "y" ]] && return 0 || return 1 ;;
+        *) return 1 ;;
+    esac
+}
+
+require_cmd() {
+    local cmd="$1"
+    command_exists "$cmd" || {
+        print_error "Missing required command: $cmd"
+        exit 1
+    }
+}
+
+require_file() {
+    local file="$1"
+    [[ -f "$file" ]] || {
+        print_error "Missing required file: $file"
+        exit 1
+    }
+}
+
+ensure_shelf_file() {
+    if [[ ! -f "$SHELF_FILE" ]]; then
+        printf '[]\n' > "$SHELF_FILE"
+    fi
+}
+
+require_clean() {
+    require_cmd git
+    local untracked
+    untracked=$(git -C "$ROOT_DIR" ls-files --others --exclude-standard)
+
+    git -C "$ROOT_DIR" diff --quiet && git -C "$ROOT_DIR" diff --cached --quiet && [[ -z "$untracked" ]] || {
+        print_error "Uncommitted changes in git"
+        exit 1
+    }
+}
+
+json_update() {
+    local tmp
+    tmp=$(mktemp)
+    jq "$@" "$SHELF_FILE" > "$tmp"
+    mv "$tmp" "$SHELF_FILE"
+}
+
+skill_name_from_path() {
+    local skill_path="$1"
+    local skill_dir
+
+    skill_dir=$(dirname "$skill_path")
+    basename "$skill_dir"
+}
+
+print_prefixed() {
+    local prefix="$1" color="$2"
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && echo -e "  ${color}${prefix} $line${RESET}"
+    done
+}
+
+list_active_skills() {
+    if [[ ! -d "$SKILLS_DIR" ]]; then
+        echo -e "  ${YELLOW}(none)${RESET}"
+        return
+    fi
+
+    local entries=()
+    local path
+    shopt -s nullglob
+    for path in "$SKILLS_DIR"/*; do
+        entries+=("$(basename "$path")")
+    done
+    shopt -u nullglob
+
+    if [[ ${#entries[@]} -eq 0 ]]; then
+        echo -e "  ${YELLOW}(none)${RESET}"
+    else
+        printf '%s\n' "${entries[@]}" | sort | print_prefixed "▸" "$CYAN"
+    fi
+}
+
+list_shelved_skills() {
+    ensure_shelf_file
+
+    local entries
+    entries=$(jq -r '.[]' "$SHELF_FILE")
+
+    if [[ -z "$entries" ]]; then
+        echo -e "  ${YELLOW}(none)${RESET}"
+    else
+        printf '%s\n' "$entries" | print_prefixed "▹" "$BLUE"
+    fi
+}
+
+cmd_census() {
+    require_cmd jq
+
+    print_header "Active minions"
+    list_active_skills
+    print_header "Shelved minions"
+    list_shelved_skills
+}
+
+cmd_activate() {
+    [[ $# -gt 0 ]] || {
+        print_error "Usage: ${SCRIPT_NAME} activate <name>..."
+        return 1
+    }
+    require_cmd jq
+    require_cmd npx
+    require_file "$LOCK_FILE"
+    ensure_shelf_file
+
+    local name source skill_path upstream_name
+    for name in "$@"; do
+        source=$(jq -r --arg n "$name" '.skills[$n].source // empty' "$LOCK_FILE")
+        skill_path=$(jq -r --arg n "$name" '.skills[$n].skillPath // empty' "$LOCK_FILE")
+        if [[ -z "$source" || -z "$skill_path" ]]; then
+            print_error "No source found for $name in .skill-lock.json"
+            return 1
+        fi
+
+        upstream_name=$(skill_name_from_path "$skill_path")
+
+        (cd "$ROOT_DIR" && npx skills add "$source" --global --agent claude-code --skill "$upstream_name" --yes > /dev/null)
+        json_update --arg n "$name" '. - [$n]'
+        print_success "Activated: ${BOLD}$name${RESET}"
+    done
+}
+
+cmd_kill() {
+    [[ $# -gt 0 ]] || {
+        print_error "Usage: ${SCRIPT_NAME} kill <name>..."
+        return 1
+    }
+    require_cmd jq
+    require_cmd npx
+    ensure_shelf_file
+
+    local name
+    for name in "$@"; do
+        (cd "$ROOT_DIR" && npx skills remove "$name" --global --agent claude-code --yes > /dev/null)
+        json_update --arg n "$name" '. + [$n] | unique | sort'
+        print_warning "Shelved: ${BOLD}$name${RESET}"
+    done
+}
+
+cmd_install_all() {
+    [[ $# -le 1 ]] || {
+        print_error "Usage: ${SCRIPT_NAME} install [repo]"
+        return 1
+    }
+    require_cmd jq
+    require_cmd npx
+    ensure_shelf_file
+    require_clean
+
+    local repo="${1:-$DEFAULT_REPO}"
+    (cd "$ROOT_DIR" && npx skills add "$repo" --global --agent claude-code --skill '*' --yes > /dev/null)
+    print_success "Installed all skills from $repo"
+
+    local removed=()
+    local name
+    while IFS= read -r name; do
+        [[ -n "$name" ]] || continue
+        if [[ -d "$SKILLS_DIR/$name" ]]; then
+            (cd "$ROOT_DIR" && npx skills remove "$name" --global --agent claude-code --yes > /dev/null)
+            removed+=("$name")
+        fi
+    done < <(jq -r '.[]' "$SHELF_FILE")
+
+    if [[ ${#removed[@]} -gt 0 ]]; then
+        print_warning "Removed shelved skills: ${BOLD}${removed[*]}${RESET}"
+    fi
+}
+
+cmd_reset_skills() {
+    [[ $# -eq 0 ]] || {
+        print_error "Usage: ${SCRIPT_NAME} reset"
+        return 1
+    }
+    require_cmd npx
+    require_clean
+
+    if ! confirm "This will purge all skills. Continue?" "n"; then
+        print_info "Cancelled."
+        return 0
+    fi
+
+    (cd "$ROOT_DIR" && npx skills remove --all --global --yes > /dev/null)
+    rm -f "$LOCK_FILE"
+    printf '[]\n' > "$SHELF_FILE"
+
+    print_success "Skills purged"
+    cat <<EOF
+
+Run these commands to reinstall:
+
+  npx skills add PaulRBerg/agent-skills
+  npx skills add sablier-labs/agent-skills
+  npx skills add vercel-labs/agent-skills
+EOF
+}
+
+cmd_mdformat_check() {
+    require_cmd uvx
+    if [[ $# -eq 0 ]]; then
+        set -- .
+    fi
+    (cd "$ROOT_DIR" && uvx mdformat --check "$@")
+}
+
+cmd_mdformat_write() {
+    require_cmd uvx
+    if [[ $# -eq 0 ]]; then
+        set -- .
+    fi
+    (cd "$ROOT_DIR" && uvx mdformat "$@")
+}
+
+cmd_help() {
+    echo -e "${BOLD}${SCRIPT_NAME}${RESET} - Agent skills management tool (v${VERSION})"
+    echo ""
+    echo -e "${BOLD}USAGE:${RESET}"
+    echo "    ${SCRIPT_NAME} [OPTIONS] COMMAND [ARGS]"
+    echo ""
+    echo -e "${BOLD}COMMANDS:${RESET}"
+    echo "    census                      Show active and shelved minions"
+    echo "    activate <name>...          Activate shelved minions"
+    echo "    kill <name>...              Deactivate/shelve minions"
+    echo "    install [repo]              Install repo minions, then remove shelved ones"
+    echo "    reset                       Purge all minions and reset shelf.json"
+    echo "    check [path]                Check Markdown formatting"
+    echo "    format [path]               Format Markdown files"
+    echo "    help                        Show this help"
+    echo ""
+    echo -e "${BOLD}OPTIONS:${RESET}"
+    echo "    --version                   Show version"
+    echo "    -h, --help                  Show help"
+    echo ""
+    echo -e "${BOLD}CONFIGURATION:${RESET}"
+    echo "    Root:   ${ROOT_DIR}"
+    echo "    Shelf:  ${SHELF_FILE}"
+    echo "    Lock:   ${LOCK_FILE}"
+    echo "    Skills: ${SKILLS_DIR}"
+    echo ""
+}
+
+main() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --version) echo "${SCRIPT_NAME} v${VERSION}"; exit 0 ;;
+            -h|--help) cmd_help; exit 0 ;;
+            *) break ;;
+        esac
+    done
+
+    local cmd="${1:-census}"
+    shift || true
+
+    case "$cmd" in
+        census)     cmd_census "$@" ;;
+        activate)   cmd_activate "$@" ;;
+        kill)       cmd_kill "$@" ;;
+        install)    cmd_install_all "$@" ;;
+        reset)      cmd_reset_skills "$@" ;;
+        check)      cmd_mdformat_check "$@" ;;
+        format)     cmd_mdformat_write "$@" ;;
+        help)                            cmd_help ;;
+        *)
+            print_error "Unknown command: $cmd"
+            echo "Run '${SCRIPT_NAME} help' for usage"
+            exit 1
+            ;;
+    esac
+}
+
+main "$@"
