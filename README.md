@@ -1,34 +1,35 @@
 # dot_minions
 
-Personal agent skill **store** and a symlink manager that fans it out to every
-harness you use.
+Personal agent skill **store** and a symlink manager that fans it out to the
+harnesses that do not read the store directly.
 
 This repo is the single home for every skill — your own plus vendored
 third-party ones. `skills/` is the store and `.skill-lock.json` /
 `skills-lock.json` are the provenance locks (managed by `npx skills`). The
 `./minion` script keeps the store fresh and **symlinks** each active skill into
-each harness, so every tool sees the same live copy and edits stay in sync.
+each symlink harness, so every tool sees the same live copy and edits stay in
+sync. Codex and Pi read `~/.agents/skills` directly, so they do not need
+symlinks under their own config directories.
 
 ## Model
 
 - **Store** — `skills/` + the global lock file, here in `~/.agents`. Adding and
   updating skills is `npx skills`' job, but it must be run with `--global` so
   the CLI targets `~/.agents/skills` instead of project-local `.agents/skills`.
-- **Harnesses** — `minion` symlinks active store skills into each of:
+- **Symlink harnesses** — `minion` symlinks active store skills into:
   - `~/.claude/skills` (Claude Code)
-  - `~/.codex/skills` (Codex)
-  - `~/.pi/agent/skills` (Pi)
-- **Symlinks are absolute** (`~/.agents/skills/<name>` → `<harness>/<name>`) and
-  uniform across harnesses. `minion` only ever touches entries whose name
-  matches a store skill — foreign skills (e.g. Codex's `plannotator-*`, Pi's
-  `prd-to-todos`) and plain files are left untouched.
+- **Direct readers** — Codex and Pi read `~/.agents/skills` directly.
+- **Symlinks are absolute** (`~/.agents/skills/<name>` → `<harness>/<name>`).
+  `minion` only ever touches entries whose name matches a store skill — foreign
+  skills and plain files are left untouched. Legacy Codex/Pi symlinks that point
+  back into the store are pruned during sync/reset.
 
 ## Contents
 
 - `skills/` — the store (one dir per skill, each with a `SKILL.md`)
 - `.skill-lock.json` / `skills-lock.json` — source/provenance locks (the CLI's)
-- `shelf.json` — skills intentionally unlinked from the harnesses
-- `minion` — CLI for syncing the store out to the harnesses
+- `shelf.json` — skills intentionally unlinked from the symlink harnesses
+- `minion` — CLI for syncing the store out to the symlink harnesses
 
 ## Quick start
 
@@ -55,8 +56,8 @@ cd .agents
 
 ### `census`
 
-Show active skills (with how many of the harnesses currently hold a live
-symlink, e.g. `3/3`) and shelved skills.
+Show active skills (with how many of the symlink harnesses currently hold a
+live symlink, e.g. `1/1`) and shelved skills.
 
 ```bash
 ./minion census
@@ -66,8 +67,8 @@ symlink, e.g. `3/3`) and shelved skills.
 
 Refresh the global store via `npx skills update --global` (best-effort —
 per-source failures are logged, not fatal), then symlink every active
-(non-shelved) store skill into every harness and prune any dead or shelved
-links.
+(non-shelved) store skill into every symlink harness and prune any dead,
+shelved, or legacy Codex/Pi links.
 
 ```bash
 ./minion install
@@ -79,7 +80,7 @@ correct are left as-is, and a manually deleted link is recreated.
 ### `add`
 
 Add skills from a repo to the global store + lock via `npx skills add --global`,
-then run the symlink fan-out so they land in every harness in one step.
+then run the symlink fan-out so they land in every symlink harness in one step.
 
 ```bash
 ./minion add treramey/skills            # all skills in the repo
@@ -91,7 +92,8 @@ symlink step.)
 
 ### `activate`
 
-Unshelve one or more store skills and symlink them back into every harness.
+Unshelve one or more store skills and symlink them back into every symlink
+harness.
 
 ```bash
 ./minion activate prototype tdd
@@ -99,8 +101,8 @@ Unshelve one or more store skills and symlink them back into every harness.
 
 ### `kill`
 
-Drop a skill's symlinks from every harness and record it in `shelf.json`. The
-store copy is kept.
+Drop a skill's symlinks from every symlink harness and record it in
+`shelf.json`. The store copy is kept.
 
 ```bash
 ./minion kill prototype
@@ -108,8 +110,8 @@ store copy is kept.
 
 ### `reset`
 
-Unlink every store skill from all harnesses and reset the shelf. Does **not**
-delete the store or the locks.
+Unlink every store skill from all symlink harnesses and reset the shelf. Does
+**not** delete the store or the locks.
 
 ```bash
 ./minion reset

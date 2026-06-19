@@ -10,7 +10,7 @@ readonly CYAN='\033[0;36m'
 readonly RESET='\033[0m'
 readonly BOLD='\033[1m'
 readonly SCRIPT_NAME="minion"
-readonly VERSION="2.2.0"
+readonly VERSION="2.2.3"
 
 SCRIPT_PATH="${BASH_SOURCE[0]}"
 while [[ -L "$SCRIPT_PATH" ]]; do
@@ -24,28 +24,18 @@ readonly SHELF_FILE="$ROOT_DIR/shelf.json"
 readonly LOCK_FILE="$ROOT_DIR/.skill-lock.json"
 readonly SKILLS_DIR="$ROOT_DIR/skills"
 
-# Harnesses the store fans out to. Symlinks are absolute and uniform across all
-# three, so depth (Claude/Codex are 2 levels deep, Pi is 3) does not matter.
+# Harnesses the store fans out to with symlinks. Pi and Codex read the global
+# store directly from ~/.agents/skills, so they do not need harness symlinks.
 readonly HARNESS_DIRS=(
     "$HOME/.claude/skills"
+)
+
+# Directories minion used to symlink into but no longer should. These are only
+# cleaned up; active skills are never linked here.
+readonly OBSOLETE_HARNESS_DIRS=(
     "$HOME/.codex/skills"
     "$HOME/.pi/agent/skills"
 )
-
-# Plannotator core skills are managed through the skills CLI like every other
-# store skill. The Plannotator binary/hooks are installed separately by
-# https://plannotator.ai/install.sh when needed; minion only manages skills.
-readonly PLANNOTATOR_CORE_SKILLS=(
-    "plannotator-review"
-    "plannotator-annotate"
-    "plannotator-last"
-)
-readonly PLANNOTATOR_EXTRA_SKILLS=(
-    "plannotator-compound"
-    "plannotator-setup-goal"
-    "plannotator-visual-explainer"
-)
-
 
 print_header()  { echo -e "\n${BOLD}${BLUE}==>${RESET} ${BOLD}$1${RESET}"; }
 print_success() { echo -e "${GREEN}✓${RESET} $1"; }
@@ -142,29 +132,9 @@ is_shelved() {
     jq -e --arg n "$name" 'index($n) != null' "$SHELF_FILE" >/dev/null 2>&1
 }
 
-array_contains() {
-    local needle="$1" item
-    shift || true
-    for item in "$@"; do
-        [[ "$item" == "$needle" ]] && return 0
-    done
-    return 1
-}
-
-is_plannotator_core_skill() { array_contains "$1" "${PLANNOTATOR_CORE_SKILLS[@]}"; }
-
 should_link_skill_to_harness() {
     local name="$1" harness="$2"
     return 0
-}
-
-shelve_plannotator_extras() {
-    local skill
-    for skill in "${PLANNOTATOR_EXTRA_SKILLS[@]}"; do
-        if [[ -d "$SKILLS_DIR/$skill" ]]; then
-            json_update --arg n "$skill" '. + [$n] | unique | sort'
-        fi
-    done
 }
 
 # Paths of symlinks in a harness that point into the store, one per line. These
@@ -182,7 +152,7 @@ store_links_in() {
     shopt -u nullglob
 }
 
-# How many harnesses currently hold a live symlink for <name>.
+# How many symlink harnesses currently hold a live symlink for <name>.
 skill_coverage() {
     local name="$1" harness target dest count=0
     for harness in "${HARNESS_DIRS[@]}"; do
@@ -200,9 +170,10 @@ skill_expected_coverage() {
 
 harness_link_count() { store_links_in "$1" | wc -l | tr -d ' '; }
 
-# Point <harness>/<name> at $SKILLS_DIR/<name> in every harness. Replaces a
-# stale copy (real dir of the same name) or any existing symlink; never touches
-# a foreign skill (a name not present in the store) or a plain file.
+# Point <harness>/<name> at $SKILLS_DIR/<name> in every symlink harness.
+# Replaces a stale copy (real dir of the same name) or any existing symlink;
+# never touches a foreign skill (a name not present in the store) or a plain
+# file.
 link_skill() {
     local name="$1" src="$SKILLS_DIR/$name"
     local harness target
@@ -222,13 +193,15 @@ link_skill() {
     done
 }
 
-# Remove <harness>/<name> in every harness, but only if it is a symlink. Never
-# deletes a real dir we do not own.
+# Remove <harness>/<name> in every symlink or obsolete harness, but only if it
+# is a store-pointing symlink. Never deletes a real dir or foreign link.
 unlink_skill() {
-    local name="$1" harness target
-    for harness in "${HARNESS_DIRS[@]}"; do
+    local name="$1" harness target dest
+    for harness in "${HARNESS_DIRS[@]}" "${OBSOLETE_HARNESS_DIRS[@]}"; do
         target="$harness/$name"
-        [[ -L "$target" ]] && rm -f "$target"
+        [[ -L "$target" ]] || continue
+        dest="$(readlink "$target")"
+        [[ "$dest" == "$SKILLS_DIR/"* ]] && rm -f "$target"
     done
     return 0
 }
@@ -245,6 +218,21 @@ prune_dead_links() {
                 rm -f "$link"
                 pruned=$((pruned + 1))
             fi
+        done < <(store_links_in "$harness")
+    done
+    echo "$pruned"
+}
+
+# Remove all store-pointing symlinks from obsolete harness directories. Echoes
+# the number pruned. This cleans up old Codex/Pi links now that they read the
+# store directly.
+prune_obsolete_links() {
+    local harness link pruned=0
+    for harness in "${OBSOLETE_HARNESS_DIRS[@]}"; do
+        while IFS= read -r link; do
+            [[ -n "$link" ]] || continue
+            rm -f "$link"
+            pruned=$((pruned + 1))
         done < <(store_links_in "$harness")
     done
     echo "$pruned"
@@ -291,29 +279,6 @@ list_shelved_skills() {
     fi
 }
 
-install_plannotator_core() {
-    [[ $# -eq 0 ]] || {
-        print_error "Usage: ${SCRIPT_NAME} plannotator-core"
-        return 1
-    }
-    require_cmd npx
-    require_cmd jq
-
-    print_header "Refreshing Plannotator core skills"
-    if (cd "$ROOT_DIR" && npx skills add backnotprop/plannotator/apps/skills/core --global --yes \
-        --skill plannotator-review \
-        --skill plannotator-annotate \
-        --skill plannotator-last); then
-        print_success "Plannotator core skills refreshed"
-    else
-        print_warning "skills CLI reported errors while refreshing Plannotator core (continuing)"
-    fi
-
-    # Core-only means the extras stay in the store but are not active unless the
-    # user explicitly reactivates them.
-    shelve_plannotator_extras
-}
-
 # --- commands ----------------------------------------------------------------
 
 cmd_census() {
@@ -344,6 +309,7 @@ cmd_activate() {
         link_skill "$name"
         print_success "Activated: ${BOLD}$name${RESET}"
     done
+    prune_obsolete_links >/dev/null
 }
 
 cmd_kill() {
@@ -383,13 +349,9 @@ cmd_install_all() {
         print_warning "update reported errors (continuing)"
     fi
 
-    # 2. Plannotator's extra skills live under a repo path that the skills CLI
-    #    update command currently mis-detects. Refresh the core skills from the
-    #    explicit core path and keep extras shelved.
-    install_plannotator_core
-
-    # 3. Fan the store out: every active (non-shelved) store skill -> harnesses.
-    print_header "Linking active skills into harnesses"
+    # 2. Fan the store out: every active (non-shelved) store skill -> symlink
+    #    harnesses.
+    print_header "Linking active skills into symlink harnesses"
     local linked=0 skipped=0 name
     while IFS= read -r name; do
         [[ -n "$name" ]] || continue
@@ -401,11 +363,13 @@ cmd_install_all() {
         linked=$((linked + 1))
     done < <(store_skills)
 
-    # 4. Drop links that are now dangling or shelved.
-    local pruned
+    # 3. Drop links that are now dangling, shelved, or in obsolete harnesses.
+    local pruned obsolete_pruned
     pruned=$(prune_dead_links)
+    obsolete_pruned=$(prune_obsolete_links)
+    pruned=$((pruned + obsolete_pruned))
 
-    # 5. Summary.
+    # 4. Summary.
     print_header "Sync summary"
     local total
     total=$(store_skills | wc -l | tr -d ' ')
@@ -414,7 +378,7 @@ cmd_install_all() {
     for harness in "${HARNESS_DIRS[@]}"; do
         print_info "$(pretty_path "$harness"): $(harness_link_count "$harness") linked"
     done
-    [[ "$pruned" -gt 0 ]] && print_warning "Pruned ${pruned} dead/shelved link(s)"
+    [[ "$pruned" -gt 0 ]] && print_warning "Pruned ${pruned} dead/shelved/obsolete link(s)"
     print_success "Install complete"
 }
 
@@ -438,7 +402,7 @@ cmd_add() {
         print_warning "npx skills add reported errors (continuing to link what landed)"
     fi
 
-    print_header "Linking active skills into harnesses"
+    print_header "Linking active skills into symlink harnesses"
     local linked=0 name
     while IFS= read -r name; do
         [[ -n "$name" ]] || continue
@@ -447,6 +411,7 @@ cmd_add() {
         linked=$((linked + 1))
     done < <(store_skills)
     prune_dead_links >/dev/null
+    prune_obsolete_links >/dev/null
 
     print_success "Added ${repo}; ${linked} active skill(s) linked"
 }
@@ -459,13 +424,13 @@ cmd_reset_skills() {
     require_cmd jq
     ensure_shelf_file
 
-    if ! confirm "Unlink every store skill from all harnesses and clear the shelf?" "n"; then
+    if ! confirm "Unlink every store skill from all symlink harnesses and clear the shelf?" "n"; then
         print_info "Cancelled."
         return 0
     fi
 
     local harness link
-    for harness in "${HARNESS_DIRS[@]}"; do
+    for harness in "${HARNESS_DIRS[@]}" "${OBSOLETE_HARNESS_DIRS[@]}"; do
         while IFS= read -r link; do
             [[ -n "$link" ]] && rm -f "$link"
         done < <(store_links_in "$harness")
@@ -492,19 +457,18 @@ cmd_mdformat_write() {
 }
 
 cmd_help() {
-    echo -e "${BOLD}${SCRIPT_NAME}${RESET} - Skill store + multi-harness symlink manager (v${VERSION})"
+    echo -e "${BOLD}${SCRIPT_NAME}${RESET} - Skill store + symlink harness manager (v${VERSION})"
     echo ""
     echo -e "${BOLD}USAGE:${RESET}"
     echo "    ${SCRIPT_NAME} [OPTIONS] COMMAND [ARGS]"
     echo ""
     echo -e "${BOLD}COMMANDS:${RESET}"
     echo "    census                      Show active (with harness coverage) and shelved minions"
-    echo "    install                     Refresh the store, refresh Plannotator core, then symlink skills"
-    echo "    plannotator-core            Refresh Plannotator core skills via npx skills add"
+    echo "    install                     Refresh the store, then symlink skills"
     echo "    add <repo> [skill...]       Add skills from a repo to the store, then symlink them"
-    echo "    activate <name>...          Unshelve store skills and symlink them into every harness"
+    echo "    activate <name>...          Unshelve store skills and symlink them into every symlink harness"
     echo "    kill <name>...              Shelve skills: drop their symlinks, keep the store copy"
-    echo "    reset                       Unlink every store skill from all harnesses and clear the shelf"
+    echo "    reset                       Unlink every store skill from all symlink harnesses and clear the shelf"
     echo "    check [path]                Check Markdown formatting"
     echo "    format [path]               Format Markdown files"
     echo "    help                        Show this help"
@@ -513,11 +477,15 @@ cmd_help() {
     echo "    --version                   Show version"
     echo "    -h, --help                  Show help"
     echo ""
-    echo -e "${BOLD}HARNESSES:${RESET}"
+    echo -e "${BOLD}SYMLINK HARNESSES:${RESET}"
     local harness
     for harness in "${HARNESS_DIRS[@]}"; do
         echo "    $(pretty_path "$harness")"
     done
+    echo ""
+    echo -e "${BOLD}DIRECT READERS:${RESET}"
+    echo "    Codex reads Store directly (no symlink)"
+    echo "    Pi reads Store directly (no symlink)"
     echo ""
     echo -e "${BOLD}CONFIGURATION:${RESET}"
     echo "    Root:   ${ROOT_DIR}"
@@ -544,8 +512,6 @@ main() {
         activate)   cmd_activate "$@" ;;
         kill)       cmd_kill "$@" ;;
         install)    cmd_install_all "$@" ;;
-        plannotator-core)
-                    install_plannotator_core "$@" ;;
         add)        cmd_add "$@" ;;
         reset)      cmd_reset_skills "$@" ;;
         check)      cmd_mdformat_check "$@" ;;
