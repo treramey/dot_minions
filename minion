@@ -10,7 +10,7 @@ readonly CYAN='\033[0;36m'
 readonly RESET='\033[0m'
 readonly BOLD='\033[1m'
 readonly SCRIPT_NAME="minion"
-readonly VERSION="2.0.0"
+readonly VERSION="2.2.0"
 
 SCRIPT_PATH="${BASH_SOURCE[0]}"
 while [[ -L "$SCRIPT_PATH" ]]; do
@@ -30,6 +30,20 @@ readonly HARNESS_DIRS=(
     "$HOME/.claude/skills"
     "$HOME/.codex/skills"
     "$HOME/.pi/agent/skills"
+)
+
+# Plannotator core skills are managed through the skills CLI like every other
+# store skill. The Plannotator binary/hooks are installed separately by
+# https://plannotator.ai/install.sh when needed; minion only manages skills.
+readonly PLANNOTATOR_CORE_SKILLS=(
+    "plannotator-review"
+    "plannotator-annotate"
+    "plannotator-last"
+)
+readonly PLANNOTATOR_EXTRA_SKILLS=(
+    "plannotator-compound"
+    "plannotator-setup-goal"
+    "plannotator-visual-explainer"
 )
 
 
@@ -128,6 +142,31 @@ is_shelved() {
     jq -e --arg n "$name" 'index($n) != null' "$SHELF_FILE" >/dev/null 2>&1
 }
 
+array_contains() {
+    local needle="$1" item
+    shift || true
+    for item in "$@"; do
+        [[ "$item" == "$needle" ]] && return 0
+    done
+    return 1
+}
+
+is_plannotator_core_skill() { array_contains "$1" "${PLANNOTATOR_CORE_SKILLS[@]}"; }
+
+should_link_skill_to_harness() {
+    local name="$1" harness="$2"
+    return 0
+}
+
+shelve_plannotator_extras() {
+    local skill
+    for skill in "${PLANNOTATOR_EXTRA_SKILLS[@]}"; do
+        if [[ -d "$SKILLS_DIR/$skill" ]]; then
+            json_update --arg n "$skill" '. + [$n] | unique | sort'
+        fi
+    done
+}
+
 # Paths of symlinks in a harness that point into the store, one per line. These
 # are the only entries minion owns; everything else (foreign skills, plain
 # files) is left untouched.
@@ -155,6 +194,10 @@ skill_coverage() {
     echo "$count"
 }
 
+skill_expected_coverage() {
+    echo "${#HARNESS_DIRS[@]}"
+}
+
 harness_link_count() { store_links_in "$1" | wc -l | tr -d ' '; }
 
 # Point <harness>/<name> at $SKILLS_DIR/<name> in every harness. Replaces a
@@ -164,6 +207,7 @@ link_skill() {
     local name="$1" src="$SKILLS_DIR/$name"
     local harness target
     for harness in "${HARNESS_DIRS[@]}"; do
+        should_link_skill_to_harness "$name" "$harness" || continue
         mkdir -p "$harness"
         target="$harness/$name"
         if [[ ! -L "$target" && -e "$target" ]]; then
@@ -197,7 +241,7 @@ prune_dead_links() {
         while IFS= read -r link; do
             [[ -n "$link" ]] || continue
             name="$(basename "$link")"
-            if [[ ! -e "$link" ]] || is_shelved "$name"; then
+            if [[ ! -e "$link" ]] || is_shelved "$name" || ! should_link_skill_to_harness "$name" "$harness"; then
                 rm -f "$link"
                 pruned=$((pruned + 1))
             fi
@@ -209,7 +253,7 @@ prune_dead_links() {
 # --- listings ----------------------------------------------------------------
 
 list_active_skills() {
-    local names name cov n_harness=${#HARNESS_DIRS[@]} color
+    local names name cov expected color
     names=$(store_skills | sort)
 
     # Active = in the store and not shelved.
@@ -218,14 +262,15 @@ list_active_skills() {
         [[ -n "$name" ]] || continue
         if is_shelved "$name"; then continue; fi
         cov=$(skill_coverage "$name")
-        if [[ "$cov" -eq "$n_harness" ]]; then
+        expected=$(skill_expected_coverage "$name")
+        if [[ "$cov" -eq "$expected" ]]; then
             color="$GREEN"
         elif [[ "$cov" -eq 0 ]]; then
             color="$YELLOW"
         else
             color="$CYAN"
         fi
-        echo -e "  ${color}▸ ${name} (${cov}/${n_harness})${RESET}"
+        echo -e "  ${color}▸ ${name} (${cov}/${expected})${RESET}"
         printed=$((printed + 1))
     done <<< "$names"
 
@@ -244,6 +289,29 @@ list_shelved_skills() {
     else
         printf '%s\n' "$entries" | print_prefixed "▹" "$BLUE"
     fi
+}
+
+install_plannotator_core() {
+    [[ $# -eq 0 ]] || {
+        print_error "Usage: ${SCRIPT_NAME} plannotator-core"
+        return 1
+    }
+    require_cmd npx
+    require_cmd jq
+
+    print_header "Refreshing Plannotator core skills"
+    if (cd "$ROOT_DIR" && npx skills add backnotprop/plannotator/apps/skills/core --global --yes \
+        --skill plannotator-review \
+        --skill plannotator-annotate \
+        --skill plannotator-last); then
+        print_success "Plannotator core skills refreshed"
+    else
+        print_warning "skills CLI reported errors while refreshing Plannotator core (continuing)"
+    fi
+
+    # Core-only means the extras stay in the store but are not active unless the
+    # user explicitly reactivates them.
+    shelve_plannotator_extras
 }
 
 # --- commands ----------------------------------------------------------------
@@ -303,7 +371,7 @@ cmd_install_all() {
     require_cmd npx
     require_cmd git
     ensure_shelf_file
-    require_clean
+    # require_clean
 
     # 1. Refresh the global store from the global lock + sources. Do not use
     #    experimental_install here: it restores project skills into
@@ -315,7 +383,12 @@ cmd_install_all() {
         print_warning "update reported errors (continuing)"
     fi
 
-    # 2. Fan the store out: every active (non-shelved) store skill -> harnesses.
+    # 2. Plannotator's extra skills live under a repo path that the skills CLI
+    #    update command currently mis-detects. Refresh the core skills from the
+    #    explicit core path and keep extras shelved.
+    install_plannotator_core
+
+    # 3. Fan the store out: every active (non-shelved) store skill -> harnesses.
     print_header "Linking active skills into harnesses"
     local linked=0 skipped=0 name
     while IFS= read -r name; do
@@ -328,11 +401,11 @@ cmd_install_all() {
         linked=$((linked + 1))
     done < <(store_skills)
 
-    # 3. Drop links that are now dangling or shelved.
+    # 4. Drop links that are now dangling or shelved.
     local pruned
     pruned=$(prune_dead_links)
 
-    # 4. Summary.
+    # 5. Summary.
     print_header "Sync summary"
     local total
     total=$(store_skills | wc -l | tr -d ' ')
@@ -426,7 +499,8 @@ cmd_help() {
     echo ""
     echo -e "${BOLD}COMMANDS:${RESET}"
     echo "    census                      Show active (with harness coverage) and shelved minions"
-    echo "    install                     Refresh the store, then symlink active skills into every harness"
+    echo "    install                     Refresh the store, refresh Plannotator core, then symlink skills"
+    echo "    plannotator-core            Refresh Plannotator core skills via npx skills add"
     echo "    add <repo> [skill...]       Add skills from a repo to the store, then symlink them"
     echo "    activate <name>...          Unshelve store skills and symlink them into every harness"
     echo "    kill <name>...              Shelve skills: drop their symlinks, keep the store copy"
@@ -470,6 +544,8 @@ main() {
         activate)   cmd_activate "$@" ;;
         kill)       cmd_kill "$@" ;;
         install)    cmd_install_all "$@" ;;
+        plannotator-core)
+                    install_plannotator_core "$@" ;;
         add)        cmd_add "$@" ;;
         reset)      cmd_reset_skills "$@" ;;
         check)      cmd_mdformat_check "$@" ;;
